@@ -1,0 +1,45 @@
+diff --git a/pid/_src/models/pid_distill_model_infer.py b/pid/_src/models/pid_distill_model_infer.py
+index caf9f2a..f7ad763 100644
+--- a/pid/_src/models/pid_distill_model_infer.py
++++ b/pid/_src/models/pid_distill_model_infer.py
+@@ -167,6 +167,7 @@ class PidInferenceModel(PixelDiTModel):
+         degrade_sigma_tensor: torch.Tensor,
+         generator: Optional[torch.Generator] = None,
+         net=None,
++        step_noises=None,
+     ) -> torch.Tensor:
+         B = noise.shape[0]
+         timescale = self.fm_trainer.timescale
+@@ -175,7 +176,7 @@ class PidInferenceModel(PixelDiTModel):
+         net = net if net is not None else self.net
+ 
+         with autocast_ctx:
+-            for t_cur, t_next in zip(t_list[:-1], t_list[1:]):
++            for step_index, (t_cur, t_next) in enumerate(zip(t_list[:-1], t_list[1:])):
+                 t_cur_batch = t_cur.expand(B)
+                 t_cur_scaled = t_cur_batch * timescale
+ 
+@@ -195,12 +196,17 @@ class PidInferenceModel(PixelDiTModel):
+                         x = x + dt * v_for_step
+                     else:
+                         x0_pred = self._velocity_to_x0(x, v_pred, t_cur_batch)
+-                        eps_infer = torch.randn(
+-                            x0_pred.shape,
+-                            device=x0_pred.device,
+-                            dtype=x0_pred.dtype,
+-                            generator=generator,
+-                        )
++                        if step_noises is None:
++                            eps_infer = torch.randn(
++                                x0_pred.shape,
++                                device=x0_pred.device,
++                                dtype=x0_pred.dtype,
++                                generator=generator,
++                            )
++                        else:
++                            # Optional fixed per-sample noise for differentiable codec
++                            # training. Default inference behavior is unchanged.
++                            eps_infer = step_noises[step_index].to(x0_pred).expand_as(x0_pred)
+                         s = [B] + [1] * (x.ndim - 1)
+                         t_next_bcast = t_next.reshape(1).expand(s)
+                         x = (1.0 - t_next_bcast) * x0_pred + t_next_bcast * eps_infer
