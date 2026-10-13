@@ -10,13 +10,13 @@ from pathlib import Path
 import torch
 
 from .models import ROOT
-from .train import load_config,resolved,training_identity
+from .train import load_config,resolved,training_identity,stage_setting
 from .data import fingerprint
 
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('--stage',choices=['A','B'],required=True)
+    parser.add_argument('--stage',choices=['A','B','2A','2B'],required=True)
     parser.add_argument('--config',default='configs/pid_codec/stage1.json')
     args=parser.parse_args();cfg=load_config(args.config)
     dest=resolved(cfg['output_dir'])/'profiles'/args.stage;dest.mkdir(parents=True,exist_ok=True)
@@ -45,7 +45,7 @@ def main():
         if not row.get('ok') and not row.get('oom'):raise RuntimeError(f'Non-OOM error; inspect {log}')
         return row
     for device in range(count):
-        low=0;high=None;batch=1;best=None
+        low=0;high=None;batch=cfg.get('profile_start_batch',1);best=None
         while True:
             row=run(device,batch,cfg['workers'])
             good=row.get('ok') and row['device_used_peak']<=hardware[device]['total']*0.95
@@ -62,11 +62,11 @@ def main():
                 if batch>1024:raise RuntimeError('Unexpectedly large feasible batch; inspect profile rather than silently cap')
             else:
                 high=batch;break
-        if low==0:raise RuntimeError('Even microbatch1 failed; use configured activation checkpointing / inspect logs')
         while high-low>1:
             batch=(low+high)//2;row=run(device,batch,cfg['workers'])
             if row.get('ok') and row['device_used_peak']<=hardware[device]['total']*.95:low=batch;best=row
             else:high=batch
+        if low==0:raise RuntimeError('Even microbatch1 failed; inspect logs')
         selections.append(best)
     micro=min(r['micro_batch'] for r in selections)
     # Time the actual loader at the selected batch; do not infer throughput from synthetic tensors.
@@ -74,7 +74,7 @@ def main():
     valid=[r for r in variants if r.get('ok') and r['device_used_peak']<=hardware[0]['total']*.95]
     if not valid:raise RuntimeError('Final data-loader sweep failed')
     fastest=max(valid,key=lambda r:r['images_per_second'])
-    target=cfg['stage_a_effective_batch_target'] if args.stage=='A' else cfg['stage_b_effective_batch_target']
+    target=stage_setting(cfg,args.stage,'effective_batch_target')
     accumulation=max(1,math.ceil(target/(micro*count)))
     output=dict(stage=args.stage,world_size=count,micro_batch=micro,gradient_accumulation=accumulation,
                 effective_batch=micro*count*accumulation,workers=fastest['workers'],hardware=hardware,

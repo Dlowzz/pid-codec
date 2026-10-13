@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import numpy as np
 import torch
 from .models import ROOT
 
@@ -13,6 +14,8 @@ def same(left,right,path='state'):
     if torch.is_tensor(left):
         if not torch.equal(left,right):
             raise AssertionError(f'{path}: tensor differs (max abs {(left.float()-right.float()).abs().max().item()})')
+    elif isinstance(left,np.ndarray):
+        assert np.array_equal(left,right),path
     elif isinstance(left,dict):
         assert left.keys()==right.keys(),path
         for key in left:same(left[key],right[key],f'{path}.{key}')

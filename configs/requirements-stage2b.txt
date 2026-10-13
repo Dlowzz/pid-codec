@@ -1,0 +1,4 @@
+# Additional loss/adapter packages; keep the existing torch/torchvision environment.
+peft==0.17.1
+DISTS-pytorch==0.1
+lpips==0.1.4

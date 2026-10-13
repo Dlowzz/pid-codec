@@ -19,7 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from .data import Images, SampleStream, fingerprint
-from .models import ROOT, FrozenPiD, load_models
+from .models import ROOT, FrozenPiD, JointCodec, load_models
 
 
 def resolved(value):
@@ -29,11 +29,15 @@ def resolved(value):
 
 def load_config(path):
     cfg=json.loads(resolved(path).read_text())
-    for key in ['output_dir','dcae_dir','manifest_dir']:
+    for key in ['output_dir']:
         if not resolved(cfg[key]).resolve().is_relative_to(ROOT):
             raise ValueError(f'{key} must stay under {ROOT}; external data roots are read-only')
     if cfg.get('ema'): raise ValueError('EMA is disabled in this experiment')
     return cfg
+
+
+def stage_setting(cfg,stage,suffix):
+    return cfg['stage_'+{'A':'a','B':'b','2A':'2a','2B':'2b'}[stage]+'_'+suffix]
 
 
 def setup(seed,local_rank=0):
@@ -106,11 +110,23 @@ def training_identity(cfg,stage,data_hash):
           'alignment_start','alignment_end','encoder_activation_checkpoint','pid_activation_checkpoint']
     payload={k:cfg[k] for k in keys}
     payload.update(stage=stage,data_hash=data_hash)
+    if stage in ('2A','2B'):
+        payload.update({k:cfg[k] for k in ['stage_2a_steps','stage_2a_lr','lambda_frequency','frequency_quality','frequency_mode','frequency_gamma','rate_targets','quantization_trainable']})
+        payload['anchors_sha256']=hashlib.sha256(resolved(cfg['quantization_anchors']).read_bytes()).hexdigest()
+    if stage=='2B':
+        payload.update({k:cfg[k] for k in ['stage_2b_steps','stage_2b_lr','stage_2b_lora_lr','pid_lora','lambda_lpips','lambda_dists','pixel_loss']})
+        import importlib.metadata
+        payload['initial_checkpoint']=cfg['initial_checkpoint']
+        payload['initial_checkpoint_sha256']=cfg['initial_checkpoint_sha256']
+        payload['dists_weights_sha256']=cfg['dists_weights_sha256']
+        payload['loss_dependencies']={name:importlib.metadata.version(name) for name in ['DISTS-pytorch','lpips','peft']}
     assets=[ROOT/cfg['pid_args'],ROOT/cfg['dcae_dir']/'verified.json',ROOT/'configs/pid_weights.json']
     payload['asset_metadata_sha256']={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in assets}
     # Changes to forward/sampler/loss code cannot silently reuse an optimizer cursor.
     source_paths=[Path(__file__),Path(__file__).with_name('models.py'),Path(__file__).with_name('data.py'),
                   ROOT/'third_party/PiD/pid/_src/models/pid_distill_model_infer.py']
+    if stage in ('2A','2B'):source_paths += [Path(__file__).with_name(n) for n in ['frequency.py','quantization.py','validation_rates.py']]
+    if stage=='2B':source_paths += [Path(__file__).with_name('perceptual.py')]
     payload['code_sha256']={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths}
     return hashlib.sha256(json.dumps(payload,sort_keys=True).encode()).hexdigest()
 
@@ -125,25 +141,46 @@ def make_loader(cfg,micro,cursor,rank,world,workers=None):
     return DataLoader(data,**opts)
 
 
-def compute_loss(codec,reference,decoder,perceptual,x,stage,weight):
+def compute_loss(codec,reference,decoder,perceptual,x,stage,weight,frequency=None,lambda_frequency=1.):
     zref=reference(x)
     with torch.autocast('cuda',dtype=torch.bfloat16):
-        z=codec(x)
+        if stage=='2B':z,raw,symbols,rates,reconstruction=codec(x,return_details=True)
+        elif stage=='2A':z,raw,symbols,rates=codec(x,return_details=True)
+        else:z=codec(x)
+        freq=z.new_zeros((),dtype=torch.float32)
         align=F.mse_loss(z.float(),zref.float())
         if stage=='A':
             total=align;l1=align.new_zeros(());lp=align.new_zeros(())
         else:
-            reconstruction=decoder(z)
+            if stage!='2B':reconstruction=decoder(z)
             l1=F.l1_loss(reconstruction.float(),x.float())
             # Frozen LPIPS params, but retain its input gradient.
             with torch.autocast('cuda',enabled=False):
                 lp=perceptual(reconstruction.float(),x.float()).mean()
-            total=l1+0.5*lp+weight*align
-    return total,{'loss':total.detach(),'alignment':align.detach(),'l1':l1.detach(),'lpips':lp.detach()}
+            if stage in ('2A','2B'):freq=frequency(reconstruction,x)
+            total=l1+0.5*lp+weight*align+lambda_frequency*freq
+    parts={'loss':total.detach(),'alignment':align.detach(),'l1':l1.detach(),'lpips':lp.detach(),
+                  'frequency':freq.detach(),'weighted_l1':l1.detach(),'weighted_lpips':.5*lp.detach(),
+                  'weighted_frequency':lambda_frequency*freq.detach(),'weighted_alignment':weight*align.detach()}
+    if stage=='2B':
+        with torch.autocast('cuda',enabled=False):
+            mse=F.mse_loss(reconstruction.float(),x.float())
+            dists=perceptual.dists_loss(reconstruction.float(),x.float()).mean()
+        total=mse+perceptual.lpips_weight*lp+lambda_frequency*freq+perceptual.dists_weight*dists+weight*align
+        parts.update(loss=total.detach(),mse=mse.detach(),dists=dists.detach(),weighted_mse=mse.detach(),
+                     weighted_l1=l1.detach()*0,weighted_lpips=perceptual.lpips_weight*lp.detach(),
+                     weighted_dists=perceptual.dists_weight*dists.detach())
+    if stage in ('2A','2B'):
+        count=(codec.module if hasattr(codec,'module') else codec).quantizer.num_rates
+        parts.update({f'rate_{r}_fraction':(rates==r).float().mean() for r in range(count)})
+    return total,parts
 
 
 @torch.no_grad()
 def validate(codec,decoder,cfg,stage,step,out,full=False):
+    if stage in ('2A','2B'):
+        from .validation_rates import validate_rates
+        return validate_rates(codec,decoder,cfg,step,out,full,stage=stage)
     import lpips
     from PIL import Image,ImageDraw
     dataset=Images(resolved(cfg['manifest_dir']),'val',cfg['seed'])
@@ -187,21 +224,52 @@ def validate(codec,decoder,cfg,stage,step,out,full=False):
     return result
 
 
+def make_frequency(cfg,stage):
+    if stage not in ('2A','2B'):return None
+    from .frequency import FrequencyLoss
+    return FrequencyLoss(cfg['frequency_quality'],cfg['frequency_mode'],cfg['frequency_gamma']).cuda()
+
+
+
+def make_perceptual(cfg,stage):
+    if stage=='A':return None
+    if stage=='2B':
+        from .perceptual import ReconstructionMetrics
+        return ReconstructionMetrics(cfg).cuda().eval().requires_grad_(False)
+    import lpips
+    return lpips.LPIPS(net='vgg',verbose=False).cuda().eval().requires_grad_(False)
+
+
+def make_trainable(codec,decoder,stage):
+    return JointCodec(codec,decoder) if stage=='2B' else codec
+
+
+def make_optimizer(codec,decoder,cfg,stage):
+    if stage=='2B':
+        groups=[dict(params=list(codec.parameters()),lr=cfg['stage_2b_lr'],name='encoder'),
+                dict(params=decoder.lora_parameters(),lr=cfg['stage_2b_lora_lr'],name='pid_lora')]
+        return torch.optim.AdamW(groups,weight_decay=cfg['weight_decay'])
+    return torch.optim.AdamW(codec.parameters(),lr=stage_setting(cfg,stage,'lr'),weight_decay=cfg['weight_decay'])
+
+
+def optimizer_parameters(optimizer):
+    return [p for group in optimizer.param_groups for p in group['params'] if p.requires_grad]
+
+
 def trial(cfg,args):
     """A real optimizer-step trial; no checkpoints, no permanent model mutation."""
     setup(cfg['seed'])
+    frequency=make_frequency(cfg,args.stage)
     total=torch.cuda.get_device_properties(0).total_memory
-    target=cfg['stage_a_effective_batch_target'] if args.stage=='A' else cfg['stage_b_effective_batch_target']
+    target=stage_setting(cfg,args.stage,'effective_batch_target')
     accum=max(1,math.ceil(target/(args.micro_batch*args.profile_world_size)))
     result=dict(stage=args.stage,micro_batch=args.micro_batch,gradient_accumulation=accum,
                 effective_batch=args.micro_batch*accum*args.profile_world_size,gpu=torch.cuda.get_device_name(),total_bytes=total,workers=args.workers)
     try:
         codec,reference,decoder=load_models(cfg,args.stage)
-        optimizer=torch.optim.AdamW(codec.parameters(),lr=cfg['stage_a_lr'] if args.stage=='A' else cfg['stage_b_lr'],weight_decay=cfg['weight_decay'])
-        perceptual=None
-        if decoder is not None:
-            import lpips
-            perceptual=lpips.LPIPS(net='vgg',verbose=False).cuda().eval().requires_grad_(False)
+        optimizer=make_optimizer(codec,decoder,cfg,args.stage)
+        perceptual=make_perceptual(cfg,args.stage)
+        trainable=make_trainable(codec,decoder,args.stage)
         loader=iter(make_loader(cfg,args.micro_batch,0,0,1,args.workers))
         torch.cuda.reset_peak_memory_stats()
         times=[];waits=[];device_peak=0
@@ -213,9 +281,9 @@ def trial(cfg,args):
                 begin=time.perf_counter()
                 x=next(loader).cuda(non_blocking=True);torch.cuda.synchronize()
                 waited+=time.perf_counter()-begin
-                loss,_=compute_loss(codec,reference,decoder,perceptual,x,args.stage,0.5)
+                loss,_=compute_loss(trainable,reference,decoder,perceptual,x,args.stage,cfg['alignment_start'],frequency,cfg.get('lambda_frequency',1.))
                 (loss/accum).backward();mean_loss+=loss.detach().item()/accum
-            norm=torch.nn.utils.clip_grad_norm_(codec.parameters(),cfg['grad_clip'],error_if_nonfinite=True)
+            norm=torch.nn.utils.clip_grad_norm_(optimizer_parameters(optimizer),cfg['grad_clip'],error_if_nonfinite=True)
             assert norm.item()>0 and torch.isfinite(loss)
             optimizer.step();torch.cuda.synchronize()
             free_now,_=torch.cuda.mem_get_info();device_peak=max(device_peak,total-free_now)
@@ -235,6 +303,7 @@ def trial(cfg,args):
 def train(cfg,args):
     rank=int(os.environ.get('RANK',0));world=int(os.environ.get('WORLD_SIZE',1));local=int(os.environ.get('LOCAL_RANK',0))
     setup(cfg['seed']+rank,local)
+    frequency=make_frequency(cfg,args.stage)
     if world>1:dist.init_process_group('nccl')
     out=resolved(args.output) if args.output else resolved(cfg['output_dir'])/f'stage_{args.stage}'
     if not out.resolve().is_relative_to(ROOT):raise ValueError('Training writes must remain under the project directory')
@@ -255,15 +324,12 @@ def train(cfg,args):
     free_now,_=torch.cuda.mem_get_info()
     required=profile['measured']['peak_reserved']+2*2**30
     if free_now<required:raise RuntimeError('GPU memory occupied since profiling; wait before starting training')
-    steps=cfg['stage_a_steps'] if args.stage=='A' else cfg['stage_b_steps']
+    steps=stage_setting(cfg,args.stage,'steps')
     stop=min(steps,args.max_steps) if args.max_steps else steps
     codec,reference,decoder=load_models(cfg,args.stage)
-    optimizer=torch.optim.AdamW(codec.parameters(),lr=cfg['stage_a_lr'] if args.stage=='A' else cfg['stage_b_lr'],weight_decay=cfg['weight_decay'])
+    optimizer=make_optimizer(codec,decoder,cfg,args.stage)
     scheduler=schedule(optimizer,steps,cfg['warmup_steps'],cfg['lr_end_fraction'])
-    perceptual=None
-    if args.stage=='B':
-        import lpips
-        perceptual=lpips.LPIPS(net='vgg',verbose=False).cuda().eval().requires_grad_(False)
+    perceptual=make_perceptual(cfg,args.stage)
     step=0;cursor=0;best=float('inf');resume_rng=None
     global_step_offset=0;transition=None
     if args.resume:
@@ -272,6 +338,9 @@ def train(cfg,args):
         assert saved['identity']==identity and saved['stage']==args.stage,'Changed code/config/data: refusing inaccurate resume'
         assert saved['batch']==dict(micro=micro,accum=accum,world=world)
         assert saved['debug']==args.debug,'Do not mix debug and production checkpoints'
+        if args.stage=='2B':
+            assert saved['pid_lora_config']==decoder.lora_metadata
+            decoder.load_lora_state_dict(saved['pid_lora'])
         codec.load_state_dict(saved['encoder'],strict=True);optimizer.load_state_dict(saved['optimizer']);scheduler.load_state_dict(saved['scheduler'])
         step=saved['stage_step'];cursor=saved['sample_cursor'];best=saved['best'];resume_rng=saved['rng_by_rank'][rank]
         global_step_offset=saved['global_optimizer_step']-step
@@ -289,12 +358,24 @@ def train(cfg,args):
         assert saved['data_fingerprint']==data_hash
         codec.load_state_dict(saved['encoder'],strict=True);del saved
     elif args.stage=='B':raise ValueError('Stage B requires --init-from stage A or --resume')
-    codec.train();wrapped=DDP(codec,device_ids=[local],gradient_as_bucket_view=True) if world>1 else codec
+    if args.stage in ('2A','2B') and not args.resume:
+        transition=codec.initialization
+        assert transition['data_fingerprint']==data_hash
+        global_step_offset=transition['global_optimizer_step']
+    if args.stage=='2B' and not args.resume:
+        cursor=transition['sample_cursor']
+    trainable=make_trainable(codec,decoder,args.stage)
+    trainable.train()
+    wrapped=DDP(trainable,device_ids=[local],gradient_as_bucket_view=True) if world>1 else trainable
     loader=iter(make_loader(cfg,micro,cursor,rank,world))
     if resume_rng:restore_rng(resume_rng)
     if rank==0:
         (out/'config.json').write_text(json.dumps(cfg,indent=2)+'\n')
         (out/'batch.json').write_text(json.dumps(profile,indent=2)+'\n')
+    if args.stage=='2B' and not args.resume:
+        training_rng=rng_state()
+        validate(codec,decoder,cfg,args.stage,0,out,full=False)
+        restore_rng(training_rng)
     interrupted=False
     # SIGTERM is handled between optimizer steps, not in the middle of an update.
     import signal
@@ -304,26 +385,27 @@ def train(cfg,args):
     signal.signal(signal.SIGTERM,request_stop);signal.signal(signal.SIGINT,request_stop)
     while step<stop:
         torch.cuda.synchronize();start=time.perf_counter();data_wait=0.
-        optimizer.zero_grad(set_to_none=True);totals={k:0. for k in ['loss','alignment','l1','lpips']}
-        weight=align_weight(step,steps,cfg) if args.stage=='B' else 1.
+        optimizer.zero_grad(set_to_none=True);totals={}
+        weight=align_weight(step,steps,cfg) if args.stage!='A' else 1.
         torch.cuda.reset_peak_memory_stats()
         for i in range(accum):
             begin=time.perf_counter();x=next(loader).cuda(non_blocking=True);data_wait+=time.perf_counter()-begin
             sync=wrapped.no_sync() if world>1 and i<accum-1 else contextlib.nullcontext()
             with sync:
-                loss,parts=compute_loss(wrapped,reference,decoder,perceptual,x,args.stage,weight)
+                loss,parts=compute_loss(wrapped,reference,decoder,perceptual,x,args.stage,weight,frequency,cfg.get('lambda_frequency',1.))
                 if not torch.isfinite(loss):raise FloatingPointError('Non-finite loss; last complete checkpoint retained')
                 (loss/accum).backward()
-            for k,v in parts.items():totals[k]+=float(v)/accum
-        norm=torch.nn.utils.clip_grad_norm_(codec.parameters(),cfg['grad_clip'],error_if_nonfinite=True)
+            for k,v in parts.items():totals[k]=totals.get(k,0.)+float(v)/accum
+        norm=torch.nn.utils.clip_grad_norm_(optimizer_parameters(optimizer),cfg['grad_clip'],error_if_nonfinite=True)
         used_lr=optimizer.param_groups[0]['lr']
+        group_lrs={group.get('name',str(i)):group['lr'] for i,group in enumerate(optimizer.param_groups)}
         optimizer.step();scheduler.step();step+=1;cursor+=effective
         torch.cuda.synchronize();elapsed=time.perf_counter()-start
         if world>1:
             t=torch.tensor(list(totals.values()),device='cuda');dist.all_reduce(t);totals=dict(zip(totals,(t/world).tolist()))
             stop_flag=torch.tensor(int(interrupted),device='cuda');dist.all_reduce(stop_flag,op=dist.ReduceOp.MAX);interrupted=bool(stop_flag.item())
         row=dict(stage=args.stage,step=step,global_optimizer_step=global_step_offset+step,
-                 **totals,lr=used_lr,lambda_align=weight,gradient_norm=float(norm),
+                 **totals,lr=used_lr,group_lrs=group_lrs,lambda_align=weight,gradient_norm=float(norm),
                  peak_allocated_gib=torch.cuda.max_memory_allocated()/2**30,peak_reserved_gib=torch.cuda.max_memory_reserved()/2**30,
                  device_used_gib=(torch.cuda.get_device_properties(local).total_memory-torch.cuda.mem_get_info()[0])/2**30,
                  images_per_second=effective/elapsed,step_seconds=elapsed,data_wait_seconds=data_wait,sample_cursor=cursor,
@@ -361,6 +443,9 @@ def train(cfg,args):
                     global_optimizer_step=row['global_optimizer_step'],sample_cursor=cursor,rng_by_rank=rngs,
                     stage_complete=step==steps,best=best,identity=identity,data_fingerprint=data_hash,
                     batch=dict(micro=micro,accum=accum,world=world),config=cfg,debug=args.debug)
+                if args.stage=='2B':
+                    saved.update(format='pid-codec-stage2b-v1',pid_lora=decoder.lora_state_dict(),pid_lora_config=decoder.lora_metadata,
+                                 pid_base_weights=json.loads((ROOT/'configs/pid_weights.json').read_text()))
                 path=out/f'step_{step:06d}.pt';atomic_save(path,saved);alias(path,out/'latest.pt')
                 if is_best:alias(path,out/'best.pt')
                 for old in sorted(out.glob('step_*.pt'))[:-cfg['keep_step_checkpoints']]:old.unlink()
@@ -373,7 +458,7 @@ def train(cfg,args):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--config',default='configs/pid_codec/stage1.json')
-    parser.add_argument('--stage',choices=['A','B'],required=True)
+    parser.add_argument('--stage',choices=['A','B','2A','2B'],required=True)
     parser.add_argument('--profile')
     parser.add_argument('--output');parser.add_argument('--resume');parser.add_argument('--init-from')
     parser.add_argument('--allow-early-transition',action='store_true')
