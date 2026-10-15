@@ -1,0 +1,57 @@
+{
+  "choice": {
+    "pixel": "Keep existing 1.25*MSE, 0.80*LPIPS, 0.15*DISTS, 0.10*full-resolution VAE latent MSE",
+    "jpeg_frequency": 0.0,
+    "gan": "0.01*[-mean(D(x_hat))]; standard 70x70 PatchGAN; fixed coefficient, no adaptive gradient ratio",
+    "discriminator_loss": "0.5*(mean(relu(1-D(x))) + mean(relu(1+D(stopgrad(x_hat)))))",
+    "note": "Comparable reconstruction/perceptual scales, not a reproduction of the four different GAN objectives. No DMD, CLIP, entropy/rate loss or additional backbone introduced."
+  },
+  "references": [
+    {
+      "work": "DiT-IC",
+      "source": "https://github.com/Eric-qi/DiT-IC/blob/main/models/losses.py",
+      "config": "https://github.com/Eric-qi/DiT-IC/blob/main/configs/train_512_gan.yaml",
+      "weights": {
+        "mse": 1.0,
+        "lpips_alex": 1.0,
+        "dists": 0.2,
+        "disc_weight": 0.5
+      },
+      "gan": "PatchGAN hinge with adaptive gradient ratio; 0.5 is NOT a fixed GAN coefficient"
+    },
+    {
+      "work": "StableCodec",
+      "source": "https://github.com/LuizScarlet/StableCodec/blob/main/src/my_utils/training_utils.py",
+      "implementation": "https://github.com/LuizScarlet/StableCodec/blob/main/src/finetune.py",
+      "weights": {
+        "mse": 2.0,
+        "lpips": 1.0,
+        "clip": 0.1,
+        "gan": 0.1
+      },
+      "gan": "DINOv2-registers multilevel sigmoid discriminator"
+    },
+    {
+      "work": "CoD-Lite",
+      "source": "https://github.com/microsoft/GenCodec/blob/main/CoD_Lite/finetuned_one_step_codec/configs/stage2.yaml",
+      "weights": {
+        "lpips_vgg": 1.0,
+        "lpips_alex": 0.5,
+        "dmd": 2.0,
+        "gan": 0.01,
+        "net_loss": 1.0
+      },
+      "gan": "DINOv2-based discriminator; objective also includes distillation"
+    },
+    {
+      "work": "OneDC",
+      "source": "https://arxiv.org/html/2505.16687v2#A2",
+      "weights": {
+        "stage2_reconstruction": 0.625,
+        "stage2_latent_gan": 0.001,
+        "discriminator": 0.01
+      },
+      "gan": "Noised-latent diffusion-feature adversary; DMD; 10 fake/discriminator updates per generator update. Read-only research; retired pipeline not run."
+    }
+  ]
+}

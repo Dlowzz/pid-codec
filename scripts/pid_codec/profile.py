@@ -16,7 +16,7 @@ from .data import fingerprint
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('--stage',choices=['A','B','2A','2B'],required=True)
+    parser.add_argument('--stage',choices=['A','B','2A','2B','2C'],required=True)
     parser.add_argument('--config',default='configs/pid_codec/stage1.json')
     args=parser.parse_args();cfg=load_config(args.config)
     dest=resolved(cfg['output_dir'])/'profiles'/args.stage;dest.mkdir(parents=True,exist_ok=True)
@@ -29,8 +29,10 @@ def main():
         hardware.append(dict(index=i,name=torch.cuda.get_device_name(i),free=free,total=total))
         if free<total*0.96:raise RuntimeError(f'GPU {i} is occupied; wait for its job before 90–95% profiling')
     visible=os.environ.get('CUDA_VISIBLE_DEVICES','').split(',') if os.environ.get('CUDA_VISIBLE_DEVICES') else [str(i) for i in range(count)]
-    trials=[];selections=[]
+    trials=[];selections=[];measurements={}
     def run(device,batch,workers):
+        key=(device,batch,workers)
+        if key in measurements:return measurements[key]
         label=f'gpu{device}_batch{batch}_workers{workers}'
         result=dest/(label+'.json');log=dest/(label+'.log')
         env=dict(os.environ,CUDA_VISIBLE_DEVICES=visible[device])
@@ -40,6 +42,7 @@ def main():
             completed=subprocess.run(command,cwd=ROOT,env=env,stdout=f,stderr=subprocess.STDOUT)
         if not result.exists():raise RuntimeError(f'Trial failed before metrics; inspect {log}')
         row=json.loads(result.read_text());trials.append(row)
+        measurements[key]=row
         print(json.dumps(row),flush=True)
         if completed.returncode and not row.get('oom'):raise RuntimeError(f'Non-OOM error; inspect {log}')
         if not row.get('ok') and not row.get('oom'):raise RuntimeError(f'Non-OOM error; inspect {log}')

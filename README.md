@@ -271,3 +271,239 @@ clipping, clipping frequency, weighted loss shares, LR, memory, throughput,
 and all-rate validation PSNR/LPIPS/DISTS/bpp curves under
 `runs/pid_codec/stage2B/curves/`. Validation curves show only measured checkpoints;
 loss shares are not gradient shares. The plots and source logs remain local.
+
+## Stage 2C: query-based side latent for pixel reconstruction
+
+`configs/pid_codec/stage2c.json` starts a separate 5,000-update run from the
+local Stage 2B best checkpoint. Encoder, projection, main quantizer, original
+PiD and the existing PiD LoRA are frozen; the LoRA remains enabled. Only the
+new query extractor, spatial AdaLN adapter and RGB residual decoder train.
+The source checkpoint is pinned under the new run directory and verified by
+SHA256. Previous stage artifacts are not changed.
+
+For each image/rate, the main encoder runs once. Its quantized latent produces
+`x_base` with the existing four-step PiD under `no_grad`. The same frozen Qwen
+VAE encodes **full 512x512** `x` and `x_base` into normalized `[B,16,64,64]`
+features, both detached. This path does not use the downsampling reference API.
+A Linear projects concatenated `Fx, Fbase, Fx-Fbase` (48 channels) to 128.
+Two cross-attention + FFN layers use 256 learned spatial queries and fixed 2D
+sin/cos positions. Each query attends to the corresponding 4x4 VAE feature
+window, preserving local correspondence. A Linear produces `[B,8,16,16]`.
+The side latent is continuous in this experiment, without quantization/coding.
+
+A learned 2x upsampling CNN maps the side latent to PiD's 32x32 patch grid.
+Independent zero-initialized Linear heads add six spatial shift/scale/gate
+increments to the **image** AdaLN output of the latter half of `patch_blocks`.
+Text/time modulation is retained. The adapter is active in **all four**
+sampling steps. Runtime hooks live in `scripts/pid_codec/side.py`; no PiD
+network forward is copied or edited. The side scope is entered inside each
+checkpointed network function, so backward recomputation sees the same side
+condition. Existing LoRA and activation checkpointing remain compatible.
+The pinned upstream source files are included in training identity checks.
+
+A second upsampling CNN maps the same side latent through five 2x stages to a
+signed RGB residual, with a zero-initialized output head. The final output is
+`clamp(x_cond + residual, -1, 1)`. Velocity prediction is unchanged. Both zero
+heads initially reproduce the frozen base in inference; upstream query gradients become
+nonzero after the heads receive their first update.
+
+The final-image objective is:
+
+```
+1.25*MSE + 0.80*LPIPS_VGG + 1.0*JPEG_frequency + 0.15*DISTS
++ 0.10*MSE(QwenVAE_full(x_hat), stopgrad(QwenVAE_full(x)))
+```
+
+Image MSE/JPEG/LPIPS use `[-1,1]`; DISTS uses `[0,1]`. Full VAE consistency
+calls the official underlying encoder and normalization without its `no_grad`
+wrapper, with VAE activation checkpointing. The original compact-latent
+alignment is logged with weight **zero**. Raw/weighted losses, side/residual
+RMS, and query/AdaLN/RGB gradient norms before clipping are recorded.
+
+All new optimizer groups use AdamW LR 1e-4, weight decay .01, BF16, 500-step
+warmup, cosine decay to 10%, clip=1. Profiling reruns the complete two-PiD
+forward/loss/backward update, selecting microbatch and accumulation for an
+effective batch near 64. The same immutable data split and stateless loader
+resume are used; the new stage begins at the source checkpoint's data cursor.
+
+```bash
+bash scripts/pid_codec/run.sh checks-2c
+bash scripts/pid_codec/run.sh profile-2c
+bash scripts/pid_codec/run.sh smoke-2c
+bash scripts/pid_codec/run.sh train-2c
+# After a handled interruption:
+bash scripts/pid_codec/run.sh resume-2c
+```
+
+The checks verify full-resolution VAE normalization/input gradients, frozen
+parameters, both side gradient paths, and four-step adapter coverage. They
+compare checkpointed and non-checkpointed forwards in the same grad mode.
+BF16 grad-enabled and `no_grad` kernels can differ slightly; this separate
+comparison is recorded in `checks/parity.json`. The resume smoke test requires
+bit-exact weights, optimizer/RNG state, validation metrics and all 12 final
+PNGs (two images across six rates) against uninterrupted training.
+
+Checkpoints under `runs/pid_codec/stage2C/stage_2C` include the new side modules,
+frozen codec/LoRA state, optimizer, scheduler, RNG, data cursor and source
+identity. Latest/best/periodic policies reuse the existing loop. Every 1,000
+updates all six main rates are validated with the **complete enhanced path**.
+Each rate reports base/AdaLN/final PSNR, LPIPS, DISTS, MSE, JPEG and VAE MSE.
+Grids show original, base, AdaLN reconstruction, signed RGB residual (4x gain,
+zero shown as gray), and final output. Best selection uses the mean final
+five-term objective across rates. `main_estimated_bpp` includes only main
+integer symbols: it excludes the continuous side latent and must never be
+reported as total codec bitrate. This stage is not a complete bitstream codec.
+
+### Stage 2C joint finetuning
+
+`configs/pid_codec/stage2c_joint.json` continues from the saved Stage 2C
+side-only checkpoint in a separate `runs/pid_codec/stage2C_joint` directory.
+All encoder, projection, existing PiD LoRA and side weights are loaded exactly.
+The optimizer and 500-step warmup/cosine schedule start fresh for 5,000 updates;
+the data cursor and global optimizer-step provenance continue from the source.
+Source SHA256, the joint-mode flag and each group's LR are checked on resume.
+
+Trainable groups are the full DC-AE encoder/projection (LR `5e-5`), the existing
+PiD LoRA (LR `1e-4`), and Query/AdaLN/RGB side modules (each LR `8e-5`). Original
+PiD weights, Qwen VAE, perceptual networks and quantization anchors stay frozen.
+The encoder/STE forward now retains gradients into the second four-step PiD
+pass. The first base reconstruction and the full-resolution VAE features used
+by the query remain stop-gradient. Losses, fixed decoder noise, six-rate
+validation, checkpoint frequency and target effective batch of 64 are reused.
+The displayed base reconstruction now uses the current encoder and LoRA.
+
+For this joint run, `side_branch.adaln_scope=all` extends modulation to all
+14 patch blocks at every one of the four sampling steps. Source heads 0–6
+are mapped to blocks 7–13; added heads for blocks 0–6 start at zero. Query,
+upsampler, RGB decoder and trained late heads are preserved exactly. The
+initialization check compares reconstructions against the source's last-half
+adapter with identical quantization and requires exact agreement. Coverage of
+network depth is independent of sampling time. The original side-only config
+defaults to `last_half` and keeps its architecture.
+
+The shared `[B,8,16,16]` side latent now uses the same per-channel hard-round
+STE quantizer as the main latent, with six fixed `[6,8]` step anchors. Main
+and side use the same sampled rate ID, and **both** AdaLN and RGB consume the
+quantized side latent. Calibration collects current query outputs conditioned
+on each main rate from 64 training and 64 separate validation images. Training
+channel standard deviations set relative channel steps; validation entropy
+calibrates one scale per rate. Side targets are `.003/.005/.01/.02/.035/.05`
+bpp, matching main target entropy per symbol with half as many side symbols.
+Existing main anchors are retained, so these are additional rate costs.
+Steps stay fixed without a rate loss; actual estimated rates can drift during
+training. Validation and Kodak reports separate main, side and summed empirical
+entropy. The sum is an estimate, not an encoded bitstream size.
+
+```bash
+bash scripts/pid_codec/run.sh calibrate-side  # Once, before the joint run
+bash scripts/pid_codec/run.sh checks-2c-joint
+bash scripts/pid_codec/run.sh profile-2c-joint
+bash scripts/pid_codec/run.sh smoke-2c-joint
+bash scripts/pid_codec/run.sh train-2c-joint
+# After a handled interruption:
+bash scripts/pid_codec/run.sh resume-2c-joint
+```
+
+The same checks additionally require nonzero encoder and LoRA gradients and
+actual updates in every optimizer group and gradients in every AdaLN head.
+Main bpp remains an empirical estimate
+reported separately from quantized-side and total estimated bpp. Checks include
+side hard-round values, STE gradients, fixed steps, and exact resume of side
+quantizer buffers and rate metrics.
+
+
+### GAN fitting run (uniform OpenImages + benchmarks)
+
+`configs/pid_codec/stage2c_gan_fit.json` continues the quantized joint Stage 2C
+model from its saved step 277 in a separate `runs/pid_codec/stage2D_gan_fit`
+directory. The existing LoRA, DC-AE, spatial Query/AdaLN and RGB residual
+branches remain jointly trainable. PiD base weights, Qwen VAE and perceptual
+networks remain frozen.
+
+The generator objective is `1.25*MSE + 0.80*LPIPS + 0.15*DISTS +
+0.10*VAE_latent_MSE + 0.01*GAN`. JPEG frequency computation is disabled.
+`GAN = -mean(D(x_hat))`; D uses the standard 70x70 PatchGAN and hinge loss.
+D has its own AdamW optimizer (lr 5e-5, betas 0.5/0.9). Generator learning
+rates remain LoRA 1e-4, side modules 8e-5 and DC-AE/projection 5e-5.
+The source comparisons and distinctions between GAN objectives are recorded
+in `configs/pid_codec/gan_references.json`. No additional pretrained backbone,
+entropy model or diffusion distillation objective is introduced.
+
+The local `data/pid_codec_openimages_fit_uniform` manifest contains 706,405
+OpenImages training images plus Kodak24, Tecnick100 (classic 1200x1200 RGB)
+and CLIC2020 Professional Validation41. Every image occurs exactly once in
+the training index: ordinary shuffled sampling, no benchmark oversampling.
+OpenImages retains its original 1,593 held-out validation images. All LSDIR
+and MLIC rows are excluded. `prepare_fit_data.py` constructs this index once
+from the existing SQLite manifest, without rescanning OpenImages.
+
+The `fit` split is a diagnostic view of benchmark images that are deliberately
+included in training. Its scores are **not independent benchmark results**.
+Periodic validation keeps OpenImages and fitting reports separate and saves
+all six rates. Checkpoint selection uses the OpenImages reconstruction
+objective, excluding the non-stationary GAN score. Both main and side bpp
+remain empirical entropy estimates, not actual entropy-coded bitstreams.
+
+```bash
+source /root/data/Compression/envs/pid/activate.sh
+python -m scripts.pid_codec.checks_gan
+bash scripts/pid_codec/run.sh profile-gan
+bash scripts/pid_codec/run.sh smoke-gan
+bash scripts/pid_codec/run.sh train-gan
+# After an interruption:
+bash scripts/pid_codec/run.sh resume-gan
+```
+
+The same training loop saves discriminator weights, optimizer and scheduler
+along with the codec, per-rank RNG and committed sample cursor. The smoke test
+compares continuous training with interrupted/resumed training, including D
+state and reconstructed images. A fresh run refuses to overwrite an existing
+run directory. Complete checkpoints can be restored without their original
+bootstrap checkpoint; inference checks architecture and base weights instead
+of requiring an unchanged optimizer-training identity. Validation caches the
+rate-independent encoder/target-VAE features and reuses perceptual models.
+A progress file distinguishes validation progress from stalled training.
+
+### Five shared main/side quantization levels
+
+`calibrate_joint.py` recalibrates the **sum** of main and side empirical entropy
+from a complete, gracefully stopped joint checkpoint. Targets default to
+`0.006, 0.012, 0.025, 0.05, 0.10` bpp. With `--main-fraction 0.6666666666666666`,
+the 16 main and 8 side channels receive a 2:1 target bit split. Both streams use
+the same rate ID but separate multipliers:
+`delta_stream[r,c] = multiplier_stream[r] * channel_std[c]`. Per-channel scales
+are fixed from calibration. Omitting `--main-fraction` instead uses a single
+shared multiplier and lets the measured bit split emerge from the distributions.
+Concatenating the two integer tensors produces `[B,24,16,16]` symbols suitable
+for a later joint entropy model. No hyperprior is added here.
+
+The side latent depends on the quantized main reconstruction, so calibration
+recomputes that reconstruction and the query features for the selected main
+steps (every candidate in shared-multiplier mode). It uses a separate validation subset, then runs the existing full
+reconstruction validation on the original fixed images. Rate targets are
+calibration points, not hard constraints: fixed steps without a rate loss can
+still drift as the encoder/query distributions change. Estimates exclude
+entropy coder overhead and any future hyperlatent stream.
+
+```bash
+python -m scripts.pid_codec.calibrate_joint \
+  --config configs/pid_codec/stage2c_gan_fit.json \
+  --checkpoint runs/pid_codec/stage2D_gan_fit/stage_2C/latest.pt \
+  --output-dir runs/pid_codec/stage2D_gan_joint5_balanced \
+  --output-config configs/pid_codec/stage2c_gan_joint5_balanced.json \
+  --main-fraction 0.6666666666666666
+python -m scripts.pid_codec.checks_gan --config configs/pid_codec/stage2c_gan_joint5_balanced.json
+python -m scripts.pid_codec.profile --stage 2C --config configs/pid_codec/stage2c_gan_joint5_balanced.json
+python -m scripts.pid_codec.train --stage 2C \
+  --config configs/pid_codec/stage2c_gan_joint5_balanced.json \
+  --profile runs/pid_codec/stage2D_gan_joint5_balanced/profiles/2C/selected.json --resume auto
+```
+
+The transition changes only the two quantizer buffers. All trainable weights,
+generator/discriminator optimizers and schedulers, RNG, step counters and the
+data cursor are verified unchanged after serialization. The old run is kept;
+the new run starts with an evaluated `latest`/`best` checkpoint and must use
+`--resume auto`. The smaller `initial_requantized.pt` is a weights-only bootstrap
+for profiling, not an optimizer resume checkpoint. Training still samples one
+uniform random rate **per image**, using that same rate for both streams;
+validation evaluates every configured rate for every image.

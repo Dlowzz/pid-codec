@@ -1,7 +1,5 @@
 """Immutable indexed split and stateless augmentation, including prefetch-safe resume."""
-import hashlib
 import json
-import math
 import random
 import sqlite3
 from pathlib import Path
